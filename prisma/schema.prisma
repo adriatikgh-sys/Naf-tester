@@ -1,0 +1,381 @@
+// Lerke — multi-tenant retail inventory monitoring
+//
+// Tenancy model: every tenant-owned row is reachable from an Organisation.
+// Multi-tenant isolation is enforced at the query layer: every query against
+// tenant-owned tables (Sku, SkuChainMapping via Sku, StockReading via Sku,
+// EmailDraft, OrganisationChainLink, User) MUST filter by organisationId.
+//
+// International-ready: currency is ISO 4217 per organisation/SKU, locale is
+// BCP 47, country codes are ISO 3166-1 alpha-2. No NOK/Norwegian defaults in
+// the schema itself — defaults are applied at onboarding in the UI layer.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7 convention).
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy & auth
+// ---------------------------------------------------------------------------
+
+model Organisation {
+  id   String @id @default(cuid())
+  name String
+  slug String @unique
+
+  /// ISO 4217, e.g. "NOK", "SEK", "EUR". Set at onboarding, no schema default.
+  currencyCode String
+  /// BCP 47, e.g. "nb-NO", "sv-SE", "en-GB". Drives UI language + email drafts.
+  locale       String
+
+  /// Default low-stock threshold for SKUs that don't set their own.
+  defaultLowStockThreshold Int @default(5)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users       User[]
+  skus        Sku[]
+  chainLinks  OrganisationChainLink[]
+  emailDrafts EmailDraft[]
+  scrapeRuns  ScrapeRun[]
+}
+
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(MEMBER)
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  emailDrafts EmailDraft[]
+
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// Retail chains & stores (shared reference data, not tenant-owned)
+// ---------------------------------------------------------------------------
+
+enum DataSourceType {
+  API            // documented or discovered JSON/REST endpoint
+  SCRAPE_STATIC  // fetch + HTML/JSON parsing (cheerio), Vercel-cron friendly
+  SCRAPE_BROWSER // requires headless browser -> external worker, not Vercel
+}
+
+model RetailChain {
+  id   String @id @default(cuid())
+  name String
+  slug String @unique // e.g. "jernia", "power" — used to pick the scraper adapter
+
+  websiteUrl  String
+  /// ISO 3166-1 alpha-2 of the chain's home market, e.g. "NO"
+  countryCode String
+
+  dataSourceType DataSourceType
+  /// Adapter-specific config: base URLs, endpoint templates, rate limits,
+  /// required headers. Shape is owned by the chain's scraper adapter.
+  connectionConfig Json @default("{}")
+
+  /// Global kill-switch (e.g. chain changed their site and scraper is broken).
+  /// Distinct from per-organisation opt-in (OrganisationChainLink.isActive).
+  isEnabled Boolean @default(true)
+
+  /// Investigation notes: what the data source actually is, verified when.
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stores    Store[]
+  mappings  SkuChainMapping[]
+  orgLinks  OrganisationChainLink[]
+  scrapeRuns ScrapeRun[]
+}
+
+model Store {
+  id String @id @default(cuid())
+
+  retailChainId String
+  retailChain   RetailChain @relation(fields: [retailChainId], references: [id], onDelete: Cascade)
+
+  /// The chain's own store identifier (whatever their API/site uses).
+  externalId String
+  name       String
+
+  address     String?
+  city        String?
+  postalCode  String?
+  /// ISO 3166-1 alpha-2
+  countryCode String
+  latitude    Decimal? @db.Decimal(9, 6)
+  longitude   Decimal? @db.Decimal(9, 6)
+
+  /// Chain-specific extras that don't fit the common columns
+  /// (region codes, warehouse flags, opening hours, ...).
+  chainMeta Json?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stockReadings StockReading[]
+  emailDrafts   EmailDraft[]
+
+  @@unique([retailChainId, externalId])
+  @@index([retailChainId])
+}
+
+// ---------------------------------------------------------------------------
+// Distributor catalog (tenant-owned)
+// ---------------------------------------------------------------------------
+
+model Sku {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  name String
+  /// EAN-13/GTIN. Optional because some catalogs have items without one.
+  ean  String?
+  /// The distributor's own article number, if different from EAN.
+  internalCode String?
+
+  /// Inputs for the lost-sales estimate:
+  /// lostSales ≈ weeksOutOfStock × avgWeeklyVelocity × unitPrice × marginRate
+  unitPrice         Decimal? @db.Decimal(12, 2)
+  /// ISO 4217; defaults to the organisation's currency at creation time.
+  currencyCode      String?
+  /// Fraction 0..1, e.g. 0.35 for 35% margin.
+  marginRate        Decimal? @db.Decimal(5, 4)
+  /// Estimated units sold per store per week (manual input until we can
+  /// derive it from reading history).
+  avgWeeklyVelocity Decimal? @db.Decimal(10, 2)
+
+  /// Per-SKU low-stock threshold; null = organisation default.
+  lowStockThreshold Int?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chainMappings SkuChainMapping[]
+  stockReadings StockReading[]
+  emailDraftSkus EmailDraftSku[]
+
+  @@unique([organisationId, ean])
+  @@index([organisationId])
+}
+
+/// Generic per-chain product ID mapping. Adding a new chain never requires a
+/// schema migration — just rows here.
+model SkuChainMapping {
+  id String @id @default(cuid())
+
+  skuId String
+  sku   Sku    @relation(fields: [skuId], references: [id], onDelete: Cascade)
+
+  retailChainId String
+  retailChain   RetailChain @relation(fields: [retailChainId], references: [id], onDelete: Cascade)
+
+  /// The chain's product identifier for this SKU (e.g. Jernia's internal
+  /// product code — NOT the EAN).
+  externalProductId String
+  /// Product page URL on the chain's site, when known.
+  productUrl String?
+  /// Adapter-specific extras.
+  metadata   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([skuId, retailChainId])
+  @@index([retailChainId, externalProductId])
+}
+
+// ---------------------------------------------------------------------------
+// Time series
+// ---------------------------------------------------------------------------
+
+enum StockStatus {
+  IN_STOCK
+  LOW_STOCK
+  OUT_OF_STOCK
+  UNKNOWN // source reported something unparseable / qualitative only
+}
+
+model StockReading {
+  /// BigInt autoincrement: this table grows fast (SKU × store × day).
+  id BigInt @id @default(autoincrement())
+
+  skuId String
+  sku   Sku    @relation(fields: [skuId], references: [id], onDelete: Cascade)
+
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  /// Exact quantity when the source exposes one; null when the source only
+  /// gives qualitative status ("in stock" / "few left").
+  quantity    Int?
+  stockStatus StockStatus
+
+  recordedAt DateTime @default(now())
+
+  scrapeRunId String?
+  scrapeRun   ScrapeRun? @relation(fields: [scrapeRunId], references: [id], onDelete: SetNull)
+
+  /// Latest-reading-per-(sku, store) via DISTINCT ON, and per-SKU trend lines.
+  @@index([skuId, storeId, recordedAt(sort: Desc)])
+  /// Per-store views (alerts page).
+  @@index([storeId, recordedAt(sort: Desc)])
+  @@index([scrapeRunId])
+}
+
+// ---------------------------------------------------------------------------
+// Chain activation (the opt-in source of truth)
+// ---------------------------------------------------------------------------
+
+/// Which chains an organisation has activated. Every scrape/API job MUST
+/// resolve its work list through this table (isActive = true), never by
+/// iterating RetailChain directly.
+model OrganisationChainLink {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  retailChainId String
+  retailChain   RetailChain @relation(fields: [retailChainId], references: [id], onDelete: Cascade)
+
+  isActive      Boolean   @default(true)
+  activatedAt   DateTime  @default(now())
+  deactivatedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([organisationId, retailChainId])
+  /// The daily cron's entry query: chains having any active link.
+  @@index([retailChainId, isActive])
+}
+
+// ---------------------------------------------------------------------------
+// Scrape runs (observability + manual trigger)
+// ---------------------------------------------------------------------------
+
+enum ScrapeRunStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  PARTIAL // completed with some item-level errors
+  FAILED
+}
+
+enum ScrapeTrigger {
+  CRON
+  MANUAL
+}
+
+model ScrapeRun {
+  id String @id @default(cuid())
+
+  retailChainId String
+  retailChain   RetailChain @relation(fields: [retailChainId], references: [id], onDelete: Cascade)
+
+  /// Set when an org admin triggers a manual run (scoped to that org's
+  /// mappings); null for cron runs covering all activated organisations.
+  organisationId String?
+  organisation   Organisation? @relation(fields: [organisationId], references: [id], onDelete: SetNull)
+
+  status  ScrapeRunStatus @default(PENDING)
+  trigger ScrapeTrigger
+
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  readingsCount Int       @default(0)
+  /// Item-level errors: [{ skuId, storeId?, message }]
+  errorSummary  Json?
+
+  createdAt DateTime @default(now())
+
+  stockReadings StockReading[]
+
+  @@index([retailChainId, createdAt(sort: Desc)])
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// AI reorder emails
+// ---------------------------------------------------------------------------
+
+enum EmailDraftStatus {
+  DRAFT
+  SENT
+}
+
+model EmailDraft {
+  id String @id @default(cuid())
+
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  createdByUserId String?
+  createdByUser   User?   @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  recipientEmail String?
+  recipientName  String?
+  subject        String
+  body           String @db.Text
+  /// BCP 47 tag the draft was generated in (from org locale, overridable).
+  language       String
+
+  status EmailDraftStatus @default(DRAFT)
+  sentAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  skus EmailDraftSku[]
+
+  @@index([organisationId, status])
+  @@index([storeId])
+}
+
+/// Snapshot of which SKUs (and their stock state) a draft covers, frozen at
+/// draft time so the email stays consistent even as new readings arrive.
+model EmailDraftSku {
+  id String @id @default(cuid())
+
+  emailDraftId String
+  emailDraft   EmailDraft @relation(fields: [emailDraftId], references: [id], onDelete: Cascade)
+
+  skuId String
+  sku   Sku    @relation(fields: [skuId], references: [id], onDelete: Cascade)
+
+  quantityAtDraft    Int?
+  stockStatusAtDraft StockStatus?
+
+  @@unique([emailDraftId, skuId])
+}
