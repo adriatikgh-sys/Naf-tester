@@ -91,6 +91,22 @@ async function main() {
     },
   })
 
+  // Real chain, present in the catalog but DISABLED until its adapter's
+  // assumptions (see src/lib/scraper/adapters/jernia.ts) are verified live.
+  await db.retailChain.create({
+    data: {
+      name: 'Jernia',
+      slug: 'jernia',
+      websiteUrl: 'https://www.jernia.no',
+      countryCode: 'NO',
+      dataSourceType: 'API',
+      isEnabled: false,
+      connectionConfig: { baseUrl: 'https://ecommerce.jernia.no', baseSiteId: 'jernia' },
+      notes:
+        'SAP Commerce (Hybris) OCC v2, JSON REST. Products keyed by internal product code, NOT EAN. Assumptions A1–A5 in the adapter must be verified against the live site before enabling.',
+    },
+  })
+
   const storeSpecs = [
     { chain: nordvare, externalId: 'NV-001', name: 'Nordvare Oslo Storo', city: 'Oslo' },
     { chain: nordvare, externalId: 'NV-014', name: 'Nordvare Bergen Lagunen', city: 'Bergen' },
