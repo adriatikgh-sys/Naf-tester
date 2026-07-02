@@ -21,6 +21,7 @@ export default auth((req) => {
 })
 
 export const config = {
-  // Everything except NextAuth's own routes, static assets, and files.
-  matcher: ['/((?!api/auth|_next/static|_next/image|favicon.ico|.*\\..*).*)'],
+  // Everything except API routes (they enforce their own auth: NextAuth
+  // handlers, CRON_SECRET on the cron route), static assets, and files.
+  matcher: ['/((?!api/|_next/static|_next/image|favicon.ico|.*\\..*).*)'],
 }
